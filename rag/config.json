@@ -1,0 +1,65 @@
+{
+  "repos_root": "repos",
+  "include_extensions": [
+    ".md",
+    ".txt",
+    ".yaml",
+    ".yml",
+    ".json"
+  ],
+  "max_file_size_kb": 512,
+  "chunk_chars": 1200,
+  "chunk_overlap": 180,
+  "max_chunks": 2500,
+  "sources": [
+    {
+      "repo": "PayloadsAllTheThings",
+      "paths": [
+        "SQL Injection",
+        "XSS Injection",
+        "Command Injection",
+        "Server Side Template Injection",
+        "File Inclusion",
+        "Insecure Deserialization",
+        "Server Side Request Forgery",
+        "JWT"
+      ]
+    },
+    {
+      "repo": "hacktricks",
+      "paths": [
+        "src/pentesting-web"
+      ]
+    },
+    {
+      "repo": "SecLists",
+      "paths": [
+        "Discovery/Web-Content",
+        "Fuzzing",
+        "Payloads",
+        "Passwords/Common-Credentials",
+        "Usernames"
+      ]
+    },
+    {
+      "repo": "nuclei-templates",
+      "paths": [
+        "http",
+        "dast"
+      ]
+    },
+    {
+      "repo": "fuzzdb",
+      "paths": [
+        "attack",
+        "discovery"
+      ]
+    },
+    {
+      "repo": "OWASP-CheatSheetSeries",
+      "paths": [
+        "cheatsheets"
+      ]
+    }
+  ]
+}

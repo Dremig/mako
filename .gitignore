@@ -1,0 +1,9 @@
+.env
+rag_data/
+__pycache__/
+*.pyc
+logs/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
