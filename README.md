@@ -38,7 +38,7 @@ This folder is a local-first knowledge base for blackbox-oriented CTF and web pe
 ## Sync
 
 ```bash
-cd /Users/Dremig/stduy/research/ctf-agent/blackbox-kb
+cd mako
 ./scripts/sync_sources.sh
 ```
 
@@ -47,7 +47,7 @@ cd /Users/Dremig/stduy/research/ctf-agent/blackbox-kb
 1. Create env file:
 
 ```bash
-cd /Users/Dremig/stduy/research/ctf-agent/blackbox-kb
+cd mako
 cp .env.example .env
 ```
 
