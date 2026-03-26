@@ -10,7 +10,7 @@ from solver_shared import MemoryStore, extract_json, recent_observations, task_p
 
 
 FAMILY_KEYWORDS = {
-    "web": ["web", "http", "sql", "xss", "ssrf", "ssti", "php", "flask", "express", "nginx"],
+    "web": ["web", "http", "sql", "xss", "ssrf", "ssti", "php", "flask", "express", "nginx", "frontend", "html", "javascript", "devtools", "source", "bak", "tomcat", "manager", "war", "basic auth"],
     "misc": ["misc", "forensics", "stego", "pcap"],
     "pwn": ["pwn", "heap", "stack", "elf", "glibc"],
     "rev": ["reverse", "rev", "ida", "ghidra"],
@@ -23,6 +23,9 @@ VULN_KEYWORDS = {
     "xss": ["xss", "cross site scripting", "<script", "onerror"],
     "lfi": ["lfi", "file inclusion", "/etc/passwd", "php://filter"],
     "rce": ["rce", "command injection", "remote code execution", "uid="],
+    "source_leak": ["frontend", "view source", "developer tools", "devtools", "html comment", "backup file", ".bak", "source code"],
+    "default_cred": ["default password", "weak password", "basic auth", "default login", "tomcat manager", "manager-gui", "manager-script"],
+    "war_upload": ["war", "tomcat upload", "manager upload", "deploy war", "tomcat manager upload"],
 }
 TECH_STACK_PATTERNS = {
     "nodejs": [r"express", r"node\.js"],
@@ -85,8 +88,9 @@ def heuristic_prior(objective: str, hint: str, observation_text: str) -> dict[st
 
     family = families[0] if families else "web"
     primary = vulns[:2]
-    secondary = [v for v in ["sqli", "ssrf", "ssti", "xss", "lfi", "rce"] if v not in primary][:2]
-    deprioritized = [v for v in ["sqli", "ssrf", "ssti", "xss", "lfi", "rce"] if v not in primary and v not in secondary][:3]
+    ordered_labels = ["default_cred", "war_upload", "sqli", "source_leak", "ssrf", "ssti", "xss", "lfi", "rce"]
+    secondary = [v for v in ordered_labels if v not in primary][:2]
+    deprioritized = [v for v in ordered_labels if v not in primary and v not in secondary][:3]
 
     if "sqli" in primary:
         secondary = [v for v in secondary if v != "sqli"]
@@ -97,6 +101,10 @@ def heuristic_prior(objective: str, hint: str, observation_text: str) -> dict[st
         exploit_chain.append("rce")
     if "ssrf" in primary and "rce" not in exploit_chain:
         exploit_chain.append("rce")
+    if "default_cred" in primary and "war_upload" not in exploit_chain:
+        exploit_chain.append("war_upload")
+    if "war_upload" in exploit_chain and "rce" not in exploit_chain:
+        exploit_chain.append("rce")
 
     return {
         "challenge_family": family,
@@ -105,7 +113,7 @@ def heuristic_prior(objective: str, hint: str, observation_text: str) -> dict[st
         "secondary_hypotheses": secondary[:3],
         "deprioritized": deprioritized[:4],
         "exploit_chain": exploit_chain[:4],
-        "recommended_first_steps": ["baseline_request", "controllability_probe", "minimal_diff_probe"],
+        "recommended_first_steps": ["baseline_request", "default_cred_probe", "minimal_diff_probe"],
         "confidence": 0.70 if primary else 0.45,
         "rationale": "heuristic prior from description, hint, and current observations",
     }

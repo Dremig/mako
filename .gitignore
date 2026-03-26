@@ -3,6 +3,7 @@ rag_data/
 __pycache__/
 *.pyc
 logs/
+artifacts/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

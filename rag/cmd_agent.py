@@ -18,9 +18,12 @@ from solver_shared import (
     discover_tools,
     extract_facts,
     extract_json,
+    endpoint_summary,
     hypothesis_summary,
+    hint_summary,
     info_gain_score,
     normalize_command,
+    repair_helper_command,
     recent_observations,
     reflection_summary,
     reflect_step,
@@ -78,6 +81,7 @@ def main() -> None:
     parser.add_argument("--memory-db", type=Path, default=Path("logs/agent_memory.sqlite"))
     parser.add_argument("--run-id", type=str, default="")
     parser.add_argument("--out", type=Path, default=Path("logs/cmd_agent_last_run.json"))
+    parser.add_argument("--artifact-dir", type=Path, default=Path("artifacts/cmd_agent"))
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -93,10 +97,22 @@ def main() -> None:
         target = "http://" + target
 
     run_id = args.run_id.strip() or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    memory = MemoryStore((root / args.memory_db).resolve(), run_id=run_id)
+    artifact_dir = (root / args.artifact_dir / run_id).resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    memory_db_path = (root / args.memory_db).resolve()
+    if not args.memory_db.is_absolute() and str(args.memory_db).startswith("logs/"):
+        memory_db_path = (artifact_dir / args.memory_db.name).resolve()
+    out_path = (root / args.out).resolve()
+    if not args.out.is_absolute() and str(args.out).startswith("logs/"):
+        out_path = (artifact_dir / args.out.name).resolve()
+
+    memory = MemoryStore(memory_db_path, run_id=run_id)
     memory.upsert_fact("target", target, 1.0, 0)
     memory.upsert_fact("objective", args.objective, 1.0, 0)
     memory.upsert_fact("hint", args.hint, 0.9, 0)
+    memory.upsert_fact("artifact.dir", str(artifact_dir), 0.95, 0)
+    memory.upsert_fact("project.root", str(root), 0.95, 0)
 
     tools = discover_tools()
     docs = load_index((root / args.index).resolve())
@@ -114,6 +130,8 @@ def main() -> None:
 
     env = os.environ.copy()
     env["TARGET_URL"] = target
+    env["AGENT_ARTIFACT_DIR"] = str(artifact_dir)
+    env["PROJECT_ROOT"] = str(root)
     env.pop("http_proxy", None)
     env.pop("https_proxy", None)
     env.pop("HTTP_PROXY", None)
@@ -165,6 +183,8 @@ def main() -> None:
         ) or "no retrieval context"
         memory_summary = memory.summary(max_items=30)
         prior_summary = task_prior_summary(memory, max_items=20)
+        endpoints_text = endpoint_summary(memory, max_items=10)
+        hints_text = hint_summary(memory, max_items=8)
         reflect_summary = reflection_summary(memory, max_items=8)
         hypo_summary = hypothesis_summary(memory, max_items=12)
         expected_phase, constraints = derive_phase_state(memory, history)
@@ -178,6 +198,17 @@ def main() -> None:
             "Minimize recon once actionable entrypoints exist. Prefer commands with the highest expected information gain.\n"
             "Only treat actual request inputs as attack surfaces: query parameters, form input names, headers, cookies, request bodies, or confirmed API fields.\n"
             "Do not treat HTML meta tags, author tags, renderer hints, or other static markup labels as controllable parameters unless they are proven to be sent in a request.\n"
+            "For frontend/source-inspection challenges, treat HTML comments, href/src links, and hinted backup filenames as candidate endpoints to fetch directly.\n"
+            "When a new endpoint candidate is known, fetch that endpoint before retrying the current page or switching to speculative exploit classes.\n"
+            "When a page exposes a POST form with known input names, submit a benign value first to observe the next stage before speculative exploit payloads.\n"
+            "When a POST form exposes hidden default inputs, submit those defaults as-is before inventing alternative parameters or attack classes.\n"
+            "When a form field's sample value is JSON text, consider a minimal malformed JSON probe to test for parser-error information leakage.\n"
+            "If a Werkzeug or traceback debug page appears, inspect it directly for leaked source comments, secrets, and flags.\n"
+            "If Tomcat Manager Basic Auth is detected, try a small Tomcat default-credential set first (for example tomcat:tomcat, tomcat:s3cret, admin:admin, manager:manager).\n"
+            "If Tomcat Manager GUI access succeeds, use one cookie jar, fetch /manager/html, parse the exact HTML upload action (including jsessionid and CSRF nonce), build a minimal WAR with a JSP reader, upload it through that exact HTML manager action, then fetch the deployed JSP to read the target file.\n"
+            "When generating helper artifacts such as WAR files or cookie jars, write them under $AGENT_ARTIFACT_DIR or the current working directory with stable names, then reuse those paths instead of mktemp-only paths.\n"
+            "For Tomcat WAR generation, prefer the local helper script $PROJECT_ROOT/scripts/build_jsp_war.py over fragile shell heredocs.\n"
+            "For the full Tomcat Manager HTML upload chain, prefer the helper $PROJECT_ROOT/scripts/tomcat_manager_read_file.py when the goal is to read a server file through a deployed JSP.\n"
             "Return ONLY JSON schema:\n"
             "{"
             "\"analysis\":\"1-2 short sentences\","
@@ -198,6 +229,8 @@ def main() -> None:
             f"Available tools: {json.dumps(available_tools, ensure_ascii=False)}\n"
             f"Active constraints:\n{constraint_text}\n\n"
             f"Task priors:\n{prior_summary}\n\n"
+            f"Endpoint candidates:\n{endpoints_text}\n\n"
+            f"Comment hints:\n{hints_text}\n\n"
             f"Persistent memory facts:\n{memory_summary}\n\n"
             f"Hypotheses:\n{hypo_summary}\n\n"
             f"Reflection constraints:\n{reflect_summary}\n\n"
@@ -229,7 +262,8 @@ def main() -> None:
             final_report = "Model decided challenge solved."
             break
 
-        cmd = validate_command(str(plan.get("command", "")).replace("{target}", target).strip())
+        raw_cmd = str(plan.get("command", "")).replace("{target}", target).strip()
+        cmd = validate_command(repair_helper_command(raw_cmd, memory))
         ok, reason = validate_action(phase=phase, expected_phase=expected_phase, command=cmd, memory=memory, history=history)
         if not ok:
             history.append(
@@ -265,7 +299,7 @@ def main() -> None:
             time.sleep(0.2)
             continue
 
-        result = run_shell_command(cmd, timeout=args.cmd_timeout, env=env, cwd=root)
+        result = run_shell_command(cmd, timeout=args.cmd_timeout, env=env, cwd=artifact_dir)
         stdout_clean = strip_noise(result["stdout"])
         stderr_clean = strip_noise(result["stderr"])
         merged = (stdout_clean + "\n" + stderr_clean)[:120000]
@@ -342,7 +376,6 @@ def main() -> None:
             found_flag=found_flag,
         )
 
-    out_path = (root / args.out).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     run_obj = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -351,7 +384,8 @@ def main() -> None:
         "objective": args.objective,
         "hint": args.hint,
         "model": chat_model,
-        "memory_db": str((root / args.memory_db).resolve()),
+        "memory_db": str(memory_db_path),
+        "artifact_dir": str(artifact_dir),
         "tools": tools,
         "memory_facts": memory.export_facts(),
         "steps": history,

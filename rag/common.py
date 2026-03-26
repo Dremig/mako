@@ -5,6 +5,7 @@ import math
 import os
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,32 @@ def require_env(name: str) -> str:
     return value
 
 
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _tls_mode() -> str:
+    if _env_truthy("OPENAI_INSECURE_TLS"):
+        return "insecure"
+    mode = os.getenv("OPENAI_TLS_MODE", "auto").strip().lower()
+    return mode if mode in {"auto", "strict", "insecure"} else "auto"
+
+
+def _is_official_openai_host(base_url: str) -> bool:
+    host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    return host in {"api.openai.com", "openai.com"}
+
+
+def _ssl_context_for(base_url: str, allow_insecure_fallback: bool = False) -> ssl.SSLContext | None:
+    mode = _tls_mode()
+    if mode == "insecure":
+        return ssl._create_unverified_context()
+    if allow_insecure_fallback and mode == "auto" and not _is_official_openai_host(base_url):
+        print(f"[warn] TLS certificate verification failed for {base_url}; retrying with insecure TLS")
+        return ssl._create_unverified_context()
+    return None
+
+
 def post_json(base_url: str, path: str, api_key: str, payload: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
     url = base_url.rstrip("/") + path
     req = urllib.request.Request(
@@ -45,14 +72,23 @@ def post_json(base_url: str, path: str, api_key: str, payload: dict[str, Any], t
         method="POST",
     )
     try:
-        insecure_tls = os.getenv("OPENAI_INSECURE_TLS", "").strip() in {"1", "true", "TRUE", "yes", "YES"}
-        context = ssl._create_unverified_context() if insecure_tls else None
+        context = _ssl_context_for(base_url)
         with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:1000]}") from exc
     except urllib.error.URLError as exc:
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc) and _tls_mode() == "auto":
+            try:
+                context = _ssl_context_for(base_url, allow_insecure_fallback=True)
+                with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as retry_exc:
+                detail = retry_exc.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"HTTP {retry_exc.code} from {url}: {detail[:1000]}") from retry_exc
+            except urllib.error.URLError as retry_exc:
+                raise RuntimeError(f"Network error for {url}: {retry_exc}") from retry_exc
         raise RuntimeError(f"Network error for {url}: {exc}") from exc
 
 

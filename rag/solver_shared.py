@@ -36,6 +36,14 @@ VULN_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "rce": [
         re.compile(r"uid=\d+\(.*\)|command not found|bin/sh", re.IGNORECASE),
     ],
+    "default_cred": [
+        re.compile(r"tomcat web application manager|manager application", re.IGNORECASE),
+        re.compile(r"www-authenticate:\s*basic realm=", re.IGNORECASE),
+    ],
+    "debug_leak": [
+        re.compile(r"werkzeug debugger|traceback \(most recent call last\)", re.IGNORECASE),
+        re.compile(r"jsondecodeerror|pin-prompt|console locked", re.IGNORECASE),
+    ],
 }
 BANNED_TOKENS = {
     "rm -rf /",
@@ -203,6 +211,71 @@ def validate_command(cmd: str) -> str:
     return command
 
 
+def repair_helper_command(command: str, memory: MemoryStore) -> str:
+    repaired = command.strip()
+    if not repaired:
+        return repaired
+
+    def replace_flag_aliases(text: str, aliases: dict[str, str]) -> str:
+        out = text
+        for old, new in aliases.items():
+            out = re.sub(rf"(?<!\S){re.escape(old)}(?=\s|$)", new, out)
+        return out
+
+    def has_flag(text: str, flag: str) -> bool:
+        return re.search(rf"(?<!\S){re.escape(flag)}(?=\s|$)", text) is not None
+
+    def append_flag(text: str, flag: str, value: str) -> str:
+        if has_flag(text, flag):
+            return text
+        return f"{text} {flag} {value}".strip()
+
+    if "tomcat_manager_read_file.py" in repaired:
+        repaired = replace_flag_aliases(
+            repaired,
+            {
+                "--url": "--base-url",
+                "--file": "--target-file",
+                "--target": "--target-file",
+            },
+        )
+        target = memory.get_fact("target") or '"$TARGET_URL"'
+        artifact_dir = memory.get_fact("artifact.dir") or '"$AGENT_ARTIFACT_DIR"'
+        target_file = memory.get_fact("target.file") or ""
+        creds = memory.get_fact("tomcat.creds") or ""
+
+        if not has_flag(repaired, "--base-url"):
+            repaired = append_flag(repaired, "--base-url", shlex.quote(target))
+        if creds and ":" in creds:
+            username, password = creds.split(":", 1)
+            if not has_flag(repaired, "--username"):
+                repaired = append_flag(repaired, "--username", shlex.quote(username))
+            if not has_flag(repaired, "--password"):
+                repaired = append_flag(repaired, "--password", shlex.quote(password))
+        if target_file and not has_flag(repaired, "--target-file"):
+            repaired = append_flag(repaired, "--target-file", shlex.quote(target_file))
+        if artifact_dir and not has_flag(repaired, "--artifact-dir"):
+            repaired = append_flag(repaired, "--artifact-dir", shlex.quote(artifact_dir))
+
+    if "build_jsp_war.py" in repaired:
+        repaired = replace_flag_aliases(
+            repaired,
+            {
+                "--output": "--out",
+                "--file": "--target-file",
+                "--target": "--target-file",
+            },
+        )
+        artifact_dir = memory.get_fact("artifact.dir") or '"$AGENT_ARTIFACT_DIR"'
+        target_file = memory.get_fact("target.file") or ""
+        if artifact_dir and not has_flag(repaired, "--out"):
+            repaired = append_flag(repaired, "--out", shlex.quote(str(Path(artifact_dir) / "readfile.war")))
+        if target_file and not has_flag(repaired, "--target-file"):
+            repaired = append_flag(repaired, "--target-file", shlex.quote(target_file))
+
+    return repaired
+
+
 def strip_noise(text: str) -> str:
     out_lines: list[str] = []
     for line in text.splitlines():
@@ -241,6 +314,33 @@ def extract_form_input_names(html: str) -> list[str]:
     return names
 
 
+def extract_hidden_inputs(html: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for match in re.finditer(r"<input\b[^>]*>", html, re.IGNORECASE):
+        tag = match.group(0)
+        type_match = re.search(r'\btype="([^"]+)"', tag, re.IGNORECASE)
+        if not type_match or type_match.group(1).strip().lower() != "hidden":
+            continue
+        name_match = re.search(r'\bname="([^"]+)"', tag, re.IGNORECASE)
+        value_match = re.search(r'\bvalue="([^"]*)"', tag, re.IGNORECASE)
+        if not name_match:
+            continue
+        items.append((name_match.group(1).strip()[:60], (value_match.group(1).strip() if value_match else "")[:120]))
+    return items
+
+
+def extract_input_values(html: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for match in re.finditer(r"<input\b[^>]*>", html, re.IGNORECASE):
+        tag = match.group(0)
+        name_match = re.search(r'\bname="([^"]+)"', tag, re.IGNORECASE)
+        value_match = re.search(r'\bvalue="([^"]*)"', tag, re.IGNORECASE)
+        if not name_match or not value_match:
+            continue
+        items.append((name_match.group(1).strip()[:60], value_match.group(1).strip()[:200]))
+    return items
+
+
 def extract_query_params_from_command(command: str) -> list[str]:
     params: list[str] = []
     for url_match in re.finditer(r"https?://[^\s\"']+", command):
@@ -255,19 +355,102 @@ def extract_query_params_from_command(command: str) -> list[str]:
     return params
 
 
+def extract_html_comments(html: str) -> list[str]:
+    comments: list[str] = []
+    for match in re.finditer(r"<!--(.*?)-->", html, re.DOTALL):
+        value = re.sub(r"\s+", " ", match.group(1)).strip()
+        if value:
+            comments.append(value[:240])
+    return comments
+
+
+def extract_relative_paths(text: str) -> list[str]:
+    candidates: list[str] = []
+
+    for match in re.finditer(r"\b(?:href|src)\s*=\s*[\"']([^\"']+)[\"']", text, re.IGNORECASE):
+        raw = match.group(1).strip()
+        if raw and not raw.startswith(("javascript:", "mailto:", "#", "http://", "https://")):
+            candidates.append(raw)
+
+    for match in re.finditer(r"\b([A-Za-z0-9._/\-]+\.(?:php|bak|txt|js|html))\b", text, re.IGNORECASE):
+        candidates.append(match.group(1).strip())
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        cleaned = candidate.lstrip("./")
+        if not cleaned or ".." in cleaned:
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned[:180])
+    return out
+
+
 def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str, float]]:
     facts: list[tuple[str, str, float]] = []
     merged = f"{stdout}\n{stderr}"
 
     for name in extract_form_input_names(stdout):
         facts.append((f"entrypoint.candidate.{name}", "form-input", 0.80))
+    for name, value in extract_hidden_inputs(stdout):
+        facts.append((f"form.hidden.{name}", value, 0.88))
+    for name, value in extract_input_values(stdout):
+        if value.startswith("{") and value.endswith("}"):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                facts.append((f"form.json_field.{name}", ",".join(sorted(str(k) for k in parsed.keys()))[:160], 0.90))
+                facts.append((f"form.sample.{name}", value[:180], 0.84))
     for name in extract_query_params_from_command(command):
         facts.append((f"entrypoint.candidate.{name}", "query-param", 0.82))
+    for comment in extract_html_comments(stdout):
+        comment_hash = hashlib.md5(comment.encode("utf-8")).hexdigest()[:8]
+        facts.append((f"hint.comment.{comment_hash}", comment, 0.84))
+    for path in extract_relative_paths(stdout):
+        path_hash = hashlib.md5(path.encode("utf-8")).hexdigest()[:8]
+        facts.append((f"endpoint.candidate.{path_hash}", path, 0.86))
     for m in re.finditer(r"<form[^>]*method=\"([A-Za-z]+)\"", stdout, re.IGNORECASE):
         facts.append(("form.method", m.group(1).upper(), 0.65))
     for m in re.finditer(r"(https?://[^\s\"']+)", merged):
         u = m.group(1)[:300]
         facts.append((f"url.seen.{hashlib.md5(u.encode()).hexdigest()[:8]}", u, 0.55))
+    server_match = re.search(r"^server:\s*([^\n\r]+)$", merged, re.IGNORECASE | re.MULTILINE)
+    if server_match:
+        facts.append(("server.banner", server_match.group(1).strip(), 0.88))
+    if re.search(r"apache-coyote|apache tomcat|tomcat web application manager", merged, re.IGNORECASE):
+        facts.append(("tech.tomcat", "true", 0.94))
+    basic_match = re.search(r'www-authenticate:\s*basic realm="([^"]+)"', merged, re.IGNORECASE)
+    if basic_match:
+        facts.append(("auth.basic.realm", basic_match.group(1).strip(), 0.92))
+        facts.append(("auth.basic.required", "true", 0.92))
+    nonce_match = re.search(r"org\.apache\.catalina\.filters\.CSRF_NONCE=([A-F0-9]+)", merged, re.IGNORECASE)
+    if nonce_match:
+        facts.append(("tomcat.csrf_nonce", nonce_match.group(1).strip(), 0.95))
+    if re.search(r"/manager/html/upload", merged, re.IGNORECASE):
+        facts.append(("tomcat.manager.upload", "true", 0.95))
+    upload_action_match = re.search(r'action="([^"]*/manager/html/upload[^"]+)"', merged, re.IGNORECASE)
+    if upload_action_match:
+        facts.append(("tomcat.upload_action", upload_action_match.group(1).replace("&amp;", "&").strip(), 0.96))
+    cred_match = re.search(r"curl\s.*\s-u\s+([A-Za-z0-9_.-]+):([^\s'\";]+)", command)
+    if not cred_match:
+        cred_match = re.search(r"\bcurl\b.*\b-u\s*([A-Za-z0-9_.-]+):([^\s'\";]+)", command)
+    if cred_match and re.search(r"tomcat web application manager|manager application", merged, re.IGNORECASE):
+        facts.append(("auth.basic.valid", "true", 0.96))
+        facts.append(("tomcat.creds", f"{cred_match.group(1)}:{cred_match.group(2)}", 0.96))
+    if re.search(r"ok - deployed application at context path", merged, re.IGNORECASE):
+        facts.append(("tomcat.deploy.success", "true", 0.97))
+        ctx_match = re.search(r"context path\s*\[([^\]]+)\]", merged, re.IGNORECASE)
+        if ctx_match:
+            facts.append(("tomcat.deploy.path", ctx_match.group(1).strip(), 0.95))
+    if re.search(r"tomcat-users\.xml", merged, re.IGNORECASE):
+        facts.append(("target.file", "/usr/local/tomcat/conf/tomcat-users.xml", 0.92))
+    for war_match in re.finditer(r"((?:/[\w.\-]+)+\.war|\b[\w.\-]+\.war\b)", merged):
+        war_path = war_match.group(1).strip()
+        if war_path:
+            facts.append(("artifact.war_path", war_path[:220], 0.86))
 
     dbms_match = re.search(r"back-end DBMS:\s*([^\n\r]+)", merged, re.IGNORECASE)
     if dbms_match:
@@ -284,6 +467,11 @@ def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str
         facts.append(("technique.union_blocked", "true", 0.85))
     if re.search(r"time-based blind|sleep\(", merged, re.IGNORECASE):
         facts.append(("technique.time_based", "true", 0.88))
+    if re.search(r"werkzeug debugger|traceback \(most recent call last\)", merged, re.IGNORECASE):
+        facts.append(("debug.framework", "werkzeug", 0.96))
+        facts.append(("debug.traceback_exposed", "true", 0.96))
+    if re.search(r"jsondecodeerror", merged, re.IGNORECASE):
+        facts.append(("parser.json_error", "true", 0.94))
 
     for vuln in detect_vuln_signals(merged):
         facts.append((f"vuln.signal.{vuln}", "true", 0.78))
@@ -317,18 +505,58 @@ def task_prior_summary(memory: MemoryStore, max_items: int = 18) -> str:
     return "\n".join([f"{k}={v} (conf={c:.2f}, step={s})" for k, v, c, s in rows])
 
 
+def endpoint_summary(memory: MemoryStore, max_items: int = 8) -> str:
+    rows = memory.prefix_rows("endpoint.candidate.", max_items=max_items)
+    if not rows:
+        return "none"
+    seen: list[str] = []
+    for _, value, _, step in rows:
+        item = f"{value} (step={step})"
+        if item not in seen:
+            seen.append(item)
+    return "\n".join(seen[:max_items])
+
+
+def hint_summary(memory: MemoryStore, max_items: int = 6) -> str:
+    rows = memory.prefix_rows("hint.comment.", max_items=max_items)
+    if not rows:
+        return "none"
+    seen: list[str] = []
+    for _, value, _, step in rows:
+        item = f"{value} (step={step})"
+        if item not in seen:
+            seen.append(item)
+    return "\n".join(seen[:max_items])
+
+
 def derive_phase_state(memory: MemoryStore, history: list[dict[str, Any]]) -> tuple[str, list[str]]:
     constraints: list[str] = []
     priors = task_prior_map(memory)
-    has_candidate_entrypoints = memory.has_prefix("entrypoint.candidate.")
+    has_candidate_entrypoints = memory.has_prefix("entrypoint.candidate.") or memory.has_prefix("endpoint.candidate.")
     has_confirmed_entrypoints = memory.has_prefix("entrypoint.confirmed.")
     has_vuln = memory.has_prefix("vuln.signal.")
     has_injection = memory.get_fact("injection.parameter") is not None
     has_dbms = memory.get_fact("dbms") is not None
     has_flag = memory.has_prefix("flag.")
+    has_valid_basic_auth = memory.get_fact("auth.basic.valid") == "true"
+    has_tomcat_upload = memory.get_fact("tomcat.manager.upload") == "true"
+    has_tomcat_deploy = memory.get_fact("tomcat.deploy.success") == "true"
+    form_method = (memory.get_fact("form.method") or "").upper()
+    has_hidden_form_defaults = memory.has_prefix("form.hidden.")
+    has_json_form_field = memory.has_prefix("form.json_field.")
+    has_debug_leak = memory.get_fact("debug.traceback_exposed") == "true"
 
     if has_flag:
         phase = "verify"
+    elif has_tomcat_deploy:
+        phase = "extract"
+        constraints.append("WAR deployment succeeded; fetch the deployed webshell/JSP and extract the target file immediately.")
+    elif has_valid_basic_auth and has_tomcat_upload:
+        phase = "exploit"
+        constraints.append("Valid Tomcat Manager GUI credentials exist; build and upload a minimal WAR instead of more credential probing.")
+    elif has_debug_leak:
+        phase = "extract"
+        constraints.append("A debug traceback is exposed; inspect the traceback and comments for secrets or flags before any further probing.")
     elif has_dbms or has_injection:
         phase = "extract"
         constraints.append("Do not return to broad recon; focus on extraction and verification.")
@@ -338,6 +566,14 @@ def derive_phase_state(memory: MemoryStore, history: list[dict[str, Any]]) -> tu
     elif has_confirmed_entrypoints or has_candidate_entrypoints:
         phase = "probe"
         constraints.append("At least one entrypoint candidate is known; probe hypotheses instead of rereading the homepage.")
+        if memory.has_prefix("endpoint.candidate."):
+            constraints.append("A linked or hinted endpoint is known; fetch the newest endpoint candidate before probing alternate hypotheses.")
+        if form_method == "POST" and memory.has_prefix("entrypoint.candidate."):
+            constraints.append("A POST form is present; submit a benign value through the known form input before repeating GET requests on the same page.")
+        if form_method == "POST" and has_hidden_form_defaults:
+            constraints.append("A POST form exposes hidden default fields; submit the form once with those default values before speculative exploitation.")
+        if has_json_form_field:
+            constraints.append("A form field contains JSON text; after a benign submission, try a minimal malformed JSON probe to test parser error leakage.")
     else:
         phase = "recon"
         constraints.append("No confirmed entrypoint yet; recon should discover parameters, methods, or endpoints.")
@@ -346,6 +582,14 @@ def derive_phase_state(memory: MemoryStore, history: list[dict[str, Any]]) -> tu
         constraints.append(f"Primary route(s) from task interpretation: {', '.join(priors['primary'][:3])}.")
     if priors["deprioritized"]:
         constraints.append(f"Do not drift into weak alternative routes without strong evidence: {', '.join(priors['deprioritized'][:4])}.")
+    if memory.get_fact("auth.basic.required") == "true" and memory.get_fact("tech.tomcat") == "true":
+        constraints.append("Tomcat Manager Basic Auth is present; prioritize a small default-credential check before unrelated exploitation.")
+    if has_valid_basic_auth and memory.get_fact("tomcat.csrf_nonce"):
+        constraints.append("A Tomcat CSRF nonce is already known; reuse it for the HTML WAR upload request.")
+    if has_valid_basic_auth and memory.get_fact("tomcat.upload_action"):
+        constraints.append("Tomcat upload action is known; reuse the exact upload action path and the same cookie jar from the authenticated manager page.")
+    if memory.get_fact("artifact.war_path"):
+        constraints.append("A WAR artifact path is already known; reuse that stable WAR file instead of rebuilding it in a random temp directory.")
 
     recent_same = 0
     if history:
@@ -380,14 +624,16 @@ def validate_action(
     history: list[dict[str, Any]],
 ) -> tuple[bool, str]:
     cmd = command.lower()
-    if expected_phase == "probe" and phase == "recon" and memory.has_prefix("entrypoint.candidate."):
+    has_candidate_entrypoints = memory.has_prefix("entrypoint.candidate.") or memory.has_prefix("endpoint.candidate.")
+    if expected_phase == "probe" and phase == "recon" and has_candidate_entrypoints:
         return False, "Known entrypoint candidates exist; recon should not continue."
     if expected_phase in {"exploit", "extract"} and phase == "recon":
         return False, "A stronger signal exists; recon is no longer the best action."
-    if memory.has_prefix("entrypoint.candidate.") and "sed -n" in cmd and "/tmp/index.html" in cmd:
+    if has_candidate_entrypoints and "sed -n" in cmd and "/tmp/index.html" in cmd:
         return False, "Re-reading the same page is low information gain after parameters are known."
     if phase in {"exploit", "extract"} and not (memory.has_prefix("entrypoint.confirmed.") or memory.has_prefix("vuln.signal.")):
-        return False, "Exploit/extract requires a confirmed entrypoint or vulnerability signal."
+        if memory.get_fact("debug.traceback_exposed") != "true" and memory.get_fact("auth.basic.valid") != "true":
+            return False, "Exploit/extract requires a confirmed entrypoint or vulnerability signal."
     if history and "skipped-duplicate-command" in str(history[-1].get("signal", "")):
         return False, "Previous action was duplicate-like; choose a materially different command."
     return True, ""
@@ -429,7 +675,12 @@ def _command_family(command: str) -> str:
         return "curl"
     if "nmap" in lower:
         return "nmap"
-    return shlex.split(command)[0] if command.strip() else "unknown"
+    if not command.strip():
+        return "unknown"
+    try:
+        return shlex.split(command)[0]
+    except ValueError:
+        return command.strip().split()[0]
 
 
 def reflect_step(
@@ -503,7 +754,7 @@ def reflect_step(
             "Use a simpler command that isolates a single hypothesis.",
             "Do not add more moving parts after an operational failure.",
         ])
-    elif gain <= 0 and phase == "recon" and memory.has_prefix("entrypoint.candidate."):
+    elif gain <= 0 and phase == "recon" and (memory.has_prefix("entrypoint.candidate.") or memory.has_prefix("endpoint.candidate.")):
         judgment = "failure"
         failure_reason = "redundant_recon"
         strategy_update = "Recon has stopped producing value. Move to controllability checks on known inputs."
@@ -586,11 +837,17 @@ def update_hypotheses(
 
     entry_candidates = [k.split("entrypoint.candidate.", 1)[1] for k, _, _ in facts if k.startswith("entrypoint.candidate.")]
     entry_confirmed = [k.split("entrypoint.confirmed.", 1)[1] for k, _, _ in facts if k.startswith("entrypoint.confirmed.")]
+    endpoint_candidates = [value for k, value, _ in facts if k.startswith("endpoint.candidate.")]
     for name in entry_candidates:
         label = f"entrypoint:{name}"
         if hypothesis_state(memory, label) is None:
             upsert_hypothesis(memory, step, "candidate", label, 0.76, "discovered request input")
             updates.append({"label": label, "state": "candidate", "why": "discovered request input"})
+    for path in endpoint_candidates:
+        label = f"endpoint:{path}"
+        if hypothesis_state(memory, label) is None:
+            upsert_hypothesis(memory, step, "candidate", label, 0.78, "discovered linked or hinted path")
+            updates.append({"label": label, "state": "candidate", "why": "discovered linked or hinted path"})
     for name in entry_confirmed:
         label = f"entrypoint:{name}"
         upsert_hypothesis(memory, step, "confirmed", label, 0.94, "confirmed controllable request input")
@@ -705,12 +962,22 @@ def recent_observations(history: list[dict[str, Any]], limit: int = 5) -> str:
 
 
 def extract_json(text: str) -> dict[str, Any]:
+    def _loads_with_repair(candidate: str) -> dict[str, Any]:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            repaired = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", candidate)
+            if repaired != candidate:
+                return json.loads(repaired)
+            raise exc
+
     text = text.strip()
+    fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
     try:
-        return json.loads(text)
+        return _loads_with_repair(fenced)
     except json.JSONDecodeError:
         pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    match = re.search(r"\{.*\}", fenced, re.DOTALL)
     if not match:
         raise RuntimeError(f"Model output is not valid JSON: {text[:500]}")
-    return json.loads(match.group(0))
+    return _loads_with_repair(match.group(0))
