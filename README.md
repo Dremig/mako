@@ -283,5 +283,16 @@ Supported default wordlists:
 1. `path-small`
 2. `param-names`
 3. `ssti`
+
+## FAQ
+
+Q: What does "mako" mean in this project?
+A: `mako` refers to Hitachi Mako (常陆茉子) and has no other meaning.
+
+问：这个项目里的 “mako” 是什么意思？
+答：`mako` 指的是常陆茉子，除此之外没有任何含义。
+
+質問：このプロジェクトにおける「mako」は何を意味しますか？
+回答：`mako` は常陸茉子を指し、それ以外の意味はありません。
 4. `xss`
 5. `cmdi`
