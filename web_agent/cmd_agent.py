@@ -13,22 +13,31 @@ from typing import Any
 
 from rag.agent import hybrid_retrieve, load_index, short_history
 from rag.common import chat_completion, load_dotenv, require_env
+from web_agent.capability import resolve_capability_gap
+from web_agent.deliberation import choose_final_proposal, run_corrector, run_recommender
+from web_agent.logistics import build_logistics_request, perform_logistics_request
+from web_agent.planner import (
+    apply_plan_patch,
+    build_plan_patch,
+    current_subtask,
+    fallback_plan,
+    persist_plan,
+    plan_summary,
+    run_plan_worker,
+)
+from web_agent.reflector import run_reflector_worker
 from web_agent.solver_shared import (
     available_actions_summary,
-    cluster_for_failure_reason,
     compile_action_command,
     FLAG_RE,
-    FAILURE_CLUSTERS,
     MemoryStore,
     derive_phase_state,
     discover_tools,
     extract_facts,
-    extract_json,
     endpoint_summary,
     hypothesis_summary,
     hint_summary,
     info_gain_score,
-    normalize_failure_reason,
     normalize_command,
     repair_helper_command,
     recent_observations,
@@ -47,229 +56,6 @@ from web_agent.task_interpreter import run_task_interpreter, should_refresh_inte
 
 def utc_now_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-STRICT_JSON_RULES = (
-    "CRITICAL OUTPUT RULES:\n"
-    "Return exactly one valid JSON object only.\n"
-    "Do not output markdown, code fences, comments, or any text before/after JSON.\n"
-    "Use double quotes for all keys/strings.\n"
-    "If uncertain, keep schema fields with safe defaults instead of adding prose.\n"
-)
-
-
-def run_reflector_policy(
-    *,
-    base_url: str,
-    api_key: str,
-    model: str,
-    step: int,
-    target: str,
-    objective: str,
-    expected_phase: str,
-    task_priors: str,
-    reflection_state: str,
-    recent_obs: str,
-    history_text: str,
-) -> dict[str, Any]:
-    system_prompt = (
-        "You are a policy reflector for a CTF web agent.\n"
-        "You do NOT output shell commands.\n"
-        "Your job is to diagnose drift/failure and emit strict controller constraints.\n"
-        f"{STRICT_JSON_RULES}"
-        "Return ONLY JSON with schema:\n"
-        "{"
-        "\"phase_override\":\"recon|probe|exploit|extract|verify|\","
-        "\"failure_cluster\":\"none|drift|low_gain_loop|tool_mismatch|timeout_spiral|hypothesis_stale|execution_error\","
-        "\"must_do\":[\"short constraint\"],"
-        "\"must_avoid\":[\"short constraint\"],"
-        "\"rationale\":\"short reason\""
-        "}"
-    )
-    user_prompt = (
-        f"Step: {step}\n"
-        f"Target: {target}\n"
-        f"Objective: {objective}\n"
-        f"Expected phase: {expected_phase}\n\n"
-        f"Task priors:\n{task_priors}\n\n"
-        f"Reflection state:\n{reflection_state}\n\n"
-        f"Recent observations:\n{recent_obs}\n\n"
-        f"Recent history:\n{history_text}\n"
-    )
-    parsed: dict[str, Any] | None = None
-    for attempt in range(1, 4):
-        raw = chat_completion(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.1,
-        )
-        try:
-            parsed = extract_json(raw)
-            break
-        except Exception:
-            if attempt >= 3:
-                parsed = {
-                    "phase_override": "",
-                    "failure_cluster": "none",
-                    "must_do": [],
-                    "must_avoid": [],
-                    "rationale": "fallback_after_json_parse_failure",
-                }
-            else:
-                user_prompt = (
-                    user_prompt
-                    + "\n\nYour previous output was not valid JSON. "
-                    + STRICT_JSON_RULES
-                )
-    out = {
-        "phase_override": str(parsed.get("phase_override", "")).strip().lower(),
-        "failure_cluster": str(parsed.get("failure_cluster", "none")).strip().lower() or "none",
-        "must_do": [],
-        "must_avoid": [],
-        "rationale": str(parsed.get("rationale", "")).strip(),
-    }
-    if out["failure_cluster"] not in FAILURE_CLUSTERS:
-        out["failure_cluster"] = "none"
-    must_do = parsed.get("must_do", [])
-    if isinstance(must_do, list):
-        out["must_do"] = [str(item).strip()[:220] for item in must_do if str(item).strip()]
-    must_avoid = parsed.get("must_avoid", [])
-    if isinstance(must_avoid, list):
-        out["must_avoid"] = [str(item).strip()[:220] for item in must_avoid if str(item).strip()]
-    return out
-
-
-def _count_recent_timeouts(history: list[dict[str, Any]], limit: int = 4) -> int:
-    count = 0
-    for item in reversed(history[-limit:]):
-        if int(item.get("returncode", 0)) == 124:
-            count += 1
-    return count
-
-
-def _normalize_constraints(values: list[str], limit: int = 4) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in values:
-        val = str(raw).strip()
-        if not val or val in seen:
-            continue
-        seen.add(val)
-        out.append(val[:220])
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _count_recent_policy_blocks(history: list[dict[str, Any]], limit: int = 4) -> int:
-    count = 0
-    for item in reversed(history[-limit:]):
-        sig = str(item.get("signal", "")).lower()
-        if "blocked-by-controller" in sig or "blocked-by-validator" in sig:
-            count += 1
-    return count
-
-
-def repair_controller_policy(
-    *,
-    expected_phase: str,
-    controller_reflection: dict[str, Any],
-    memory: MemoryStore,
-    history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    out = {
-        "phase_override": str(controller_reflection.get("phase_override", "")).strip().lower(),
-        "failure_cluster": str(controller_reflection.get("failure_cluster", "none")).strip().lower() or "none",
-        "must_do": [str(item).strip() for item in controller_reflection.get("must_do", []) if str(item).strip()],
-        "must_avoid": [str(item).strip() for item in controller_reflection.get("must_avoid", []) if str(item).strip()],
-        "rationale": str(controller_reflection.get("rationale", "")).strip(),
-        "requirements": {
-            "change_command_family": False,
-            "require_explicit_success_signal": False,
-        },
-    }
-
-    last_failure_reason = (memory.get_fact("reflect.last_failure_reason") or "").strip().lower()
-    normalized_failure_reason = normalize_failure_reason(last_failure_reason)
-    last_family = (memory.get_fact("reflect.last_command_family") or "").strip().lower()
-    recent_timeouts = _count_recent_timeouts(history)
-    recent_policy_blocks = _count_recent_policy_blocks(history, limit=4)
-    has_entry = memory.has_prefix("entrypoint.confirmed.") or memory.has_prefix("entrypoint.candidate.")
-    has_vuln = memory.has_prefix("vuln.signal.") or memory.get_fact("injection.parameter") is not None
-
-    if normalized_failure_reason in {"timeout_on_valid_path", "timeout_without_signal"} or recent_timeouts >= 2:
-        out["failure_cluster"] = "timeout_spiral"
-        out["must_avoid"].append("Avoid another broad long-running command; reduce scope before retry.")
-        out["must_do"].append("Use a short command that validates one focused hypothesis.")
-        out["requirements"]["change_command_family"] = True
-        out["requirements"]["require_explicit_success_signal"] = True
-    elif normalized_failure_reason in {"repeated_low_gain_pattern", "no_new_signal", "redundant_recon"}:
-        out["failure_cluster"] = "low_gain_loop"
-        out["must_avoid"].append("Do not repeat low-information commands on the same surface.")
-        out["must_do"].append("Change action style and target a different observable signal.")
-        out["requirements"]["change_command_family"] = True
-        out["requirements"]["require_explicit_success_signal"] = True
-    elif normalized_failure_reason == "tool_unavailable":
-        out["failure_cluster"] = "tool_mismatch"
-        out["must_avoid"].append("Do not call unavailable tools again.")
-        out["must_do"].append("Select only discovered available tools.")
-    elif normalized_failure_reason == "missing_required_parameter":
-        out["failure_cluster"] = "hypothesis_stale"
-        out["must_avoid"].append("Do not continue broad route discovery while required-parameter errors persist.")
-        out["must_do"].append("Keep endpoint constant and recover required parameter names/schema from response and source.")
-        out["requirements"]["require_explicit_success_signal"] = True
-    elif normalized_failure_reason == "method_not_allowed":
-        out["failure_cluster"] = "execution_error"
-        out["must_avoid"].append("Do not switch to unrelated endpoints before recovering allowed methods.")
-        out["must_do"].append("Recover allowed HTTP method(s) and retry with minimal request-body variants.")
-        out["requirements"]["require_explicit_success_signal"] = True
-    elif normalized_failure_reason == "auth_required":
-        out["failure_cluster"] = "tool_mismatch"
-        out["must_avoid"].append("Avoid unauthenticated brute-force endpoint discovery under an auth gate.")
-        out["must_do"].append("Focus on token/session/auth acquisition and preserve session context across requests.")
-        out["requirements"]["require_explicit_success_signal"] = True
-    elif normalized_failure_reason == "invalid_parameter_format":
-        out["failure_cluster"] = "execution_error"
-        out["must_avoid"].append("Do not add new attack surfaces before format recovery succeeds.")
-        out["must_do"].append("Keep endpoint fixed and vary one parameter format dimension until error-class changes.")
-        out["requirements"]["require_explicit_success_signal"] = True
-    elif normalized_failure_reason == "command_failed":
-        out["failure_cluster"] = "execution_error"
-        out["must_do"].append("Reduce command complexity and isolate one variable.")
-        out["requirements"]["require_explicit_success_signal"] = True
-
-    phase_override = out["phase_override"]
-    if phase_override not in {"", "recon", "probe", "exploit", "extract", "verify"}:
-        phase_override = ""
-    # Guard against unsafe phase drift: don't allow recon regression after strong signals.
-    if phase_override == "recon" and (has_entry or has_vuln):
-        phase_override = "probe"
-        out["must_avoid"].append("Do not regress to recon when entrypoint/vuln signals already exist.")
-    # Guard against unsupported escalation without evidence.
-    if phase_override in {"exploit", "extract"} and not (has_entry or has_vuln):
-        phase_override = expected_phase
-        out["must_do"].append("Gather controllability evidence before exploit/extract escalation.")
-    # If cluster indicates timeout spiral, avoid forcing exploit unless route is clearly valid.
-    if out["failure_cluster"] == "timeout_spiral" and phase_override == "exploit" and not has_vuln:
-        phase_override = "probe"
-    out["phase_override"] = phase_override
-
-    # Avoid lock-up: if policy keeps blocking, temporarily relax hard requirements.
-    if recent_policy_blocks >= 2:
-        out["requirements"]["change_command_family"] = False
-        out["requirements"]["require_explicit_success_signal"] = False
-        out["must_do"].append("Policy relaxation: pick any valid low-risk command that can produce fresh evidence.")
-        out["must_avoid"] = [x for x in out["must_avoid"] if "command family" not in x.lower()]
-        if out["failure_cluster"] in {"low_gain_loop", "execution_error"}:
-            out["failure_cluster"] = "none"
-
-    out["must_do"] = _normalize_constraints(out["must_do"], limit=4)
-    out["must_avoid"] = _normalize_constraints(out["must_avoid"], limit=4)
-    if not out["rationale"]:
-        out["rationale"] = f"repaired_by_rules:{out['failure_cluster']}"
-    return out
 
 
 def summarize_run(
@@ -340,96 +126,6 @@ def run_interpreter_worker(
     )
     memory.add_event(step, "worker_interpreter", json.dumps(prior, ensure_ascii=False)[:3000])
     return prior
-
-
-def run_reflector_worker(
-    *,
-    step: int,
-    base_url: str,
-    api_key: str,
-    model: str,
-    target: str,
-    objective: str,
-    expected_phase: str,
-    task_priors: str,
-    reflection_state: str,
-    recent_obs: str,
-    history_text: str,
-    memory: MemoryStore,
-    history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    raw = run_reflector_policy(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        step=step,
-        target=target,
-        objective=objective,
-        expected_phase=expected_phase,
-        task_priors=task_priors,
-        reflection_state=reflection_state,
-        recent_obs=recent_obs,
-        history_text=history_text,
-    )
-    repaired = repair_controller_policy(
-        expected_phase=expected_phase,
-        controller_reflection=raw,
-        memory=memory,
-        history=history,
-    )
-    memory.add_event(step, "worker_reflector", json.dumps(repaired, ensure_ascii=False)[:3000])
-    return repaired
-
-
-def run_solver_worker(
-    *,
-    base_url: str,
-    api_key: str,
-    model: str,
-    planner_prompt: str,
-    user_prompt: str,
-) -> dict[str, Any]:
-    strict_planner_prompt = planner_prompt + "\n" + STRICT_JSON_RULES
-    local_user_prompt = user_prompt
-    for attempt in range(1, 4):
-        raw = chat_completion(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            messages=[{"role": "system", "content": strict_planner_prompt}, {"role": "user", "content": local_user_prompt}],
-            temperature=0.2,
-        )
-        try:
-            return extract_json(raw)
-        except Exception:
-            if attempt >= 3:
-                return {
-                    "analysis": "Fallback plan after repeated JSON parse failures.",
-                    "confidence": 0.05,
-                    "decision": "command",
-                    "phase": "recon",
-                    "command": "curl -si $TARGET_URL/robots.txt",
-                    "action": {},
-                    "success_signal": "HTTP response with status and body collected",
-                    "next_if_fail": "curl -si $TARGET_URL/",
-                }
-            local_user_prompt = (
-                user_prompt
-                + "\n\nYour previous output was not valid JSON. "
-                + STRICT_JSON_RULES
-            )
-    return {
-        "analysis": "Fallback plan after unexpected retry path.",
-        "confidence": 0.01,
-        "decision": "command",
-        "phase": "recon",
-        "command": "curl -si $TARGET_URL/",
-        "action": {},
-        "success_signal": "HTTP response observed",
-        "next_if_fail": "curl -si $TARGET_URL/robots.txt",
-    }
-
-
 class QueueWorkerOrchestrator:
     def __init__(self, *, max_workers: int = 2) -> None:
         self._jobs: Queue[tuple[int, str, dict[str, Any]] | None] = Queue()
@@ -556,10 +252,14 @@ def main() -> None:
     print(f"[cmd-agent] run_id={run_id} model={chat_model} tools={','.join(available_tools) if available_tools else 'none'} docs={len(docs)}")
 
     history: list[dict[str, Any]] = []
+    capability_history: list[dict[str, Any]] = []
+    capability_steps = 0
     command_seen: dict[str, int] = {}
     found_flag = ""
     done = False
     final_report = ""
+    current_plan = fallback_plan(memory)
+    persist_plan(memory, current_plan, step=0)
     orchestrator = QueueWorkerOrchestrator(max_workers=2) if args.worker_mode == "threaded" else None
 
     env = os.environ.copy()
@@ -757,12 +457,42 @@ def main() -> None:
             )
             memory.add_event(step, "controller_reflection", json.dumps(controller_reflection, ensure_ascii=False))
             constraint_text = "\n".join(f"- {item}" for item in constraints) if constraints else "- none"
+            if refresh_interpreter or not current_subtask(current_plan):
+                current_plan = run_plan_worker(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=chat_model,
+                    target=target,
+                    objective=args.objective,
+                    hint=args.hint,
+                    task_priors=prior_summary,
+                    endpoints_text=endpoints_text,
+                    memory_summary=memory_summary,
+                    hypotheses_text=hypo_summary,
+                    actions_text=actions_text,
+                    reflection_text=reflect_summary,
+                    controller_reflection=controller_reflection,
+                    history_text=short_history(history),
+                    recent_obs=recent_observations(history),
+                    memory=memory,
+                )
+                persist_plan(memory, current_plan, step)
+                memory.add_event(step, "plan_refresh", json.dumps(current_plan, ensure_ascii=False)[:3000])
+            active_subtask = current_subtask(current_plan)
+            if active_subtask:
+                expected_phase = str(active_subtask.get("phase", expected_phase)).strip().lower() or expected_phase
+            active_title = str(active_subtask.get("title", "")).strip() or "none"
+            active_goal = str(active_subtask.get("goal", "")).strip() or "none"
+            active_signal = str(active_subtask.get("success_signal", "")).strip() or "none"
+            active_action = str(active_subtask.get("suggested_action", "")).strip() or ""
 
             planner_prompt = (
                 "You are a Codex-style CTF command agent.\n"
+                "A planner has already selected the current subtask. Execute that subtask rather than improvising a brand-new route.\n"
                 "A separate interpreter has already produced task priors. Treat those priors as strong guidance unless runtime evidence is overwhelming.\n"
                 "Output one concrete shell command per step, then iterate from observed output.\n"
                 "Use persistent memory facts, hypotheses, and reflection constraints as hard constraints.\n"
+                "Treat the current subtask as the primary objective for this step.\n"
                 "Minimize recon once actionable entrypoints exist. Prefer commands with the highest expected information gain.\n"
                 "Only treat actual request inputs as attack surfaces: query parameters, form input names, headers, cookies, request bodies, or confirmed API fields.\n"
                 "Do not treat HTML meta tags, author tags, renderer hints, or other static markup labels as controllable parameters unless they are proven to be sent in a request.\n"
@@ -777,6 +507,9 @@ def main() -> None:
                 "When generating helper artifacts such as WAR files or cookie jars, write them under $AGENT_ARTIFACT_DIR or the current working directory with stable names, then reuse those paths instead of mktemp-only paths.\n"
                 "For Tomcat WAR generation, prefer the local helper script $PROJECT_ROOT/scripts/build_jsp_war.py over fragile shell heredocs.\n"
                 "For the full Tomcat Manager HTML upload chain, prefer the helper $PROJECT_ROOT/scripts/tomcat_manager_read_file.py when the goal is to read a server file through a deployed JSP.\n"
+                "If the current subtask is about extracting routes/forms from downloaded HTML, prefer the structured action `extract_html_attack_surface` instead of ad-hoc parsing scripts or optional dependencies like bs4.\n"
+                "If the current subtask is about abnormal empty replies / readiness / protocol mismatch, prefer the structured action `service_recovery_probe`.\n"
+                "If the planner suggested a structured action, use it unless there is a clear stronger reason not to.\n"
                 "Return ONLY JSON schema:\n"
                 "{"
                 "\"analysis\":\"1-2 short sentences\","
@@ -795,6 +528,11 @@ def main() -> None:
                 f"Hint: {args.hint}\n"
                 f"Step: {step}/{args.max_steps}\n"
                 f"Expected phase: {expected_phase}\n"
+                f"Current subtask title: {active_title}\n"
+                f"Current subtask goal: {active_goal}\n"
+                f"Current subtask success signal: {active_signal}\n"
+                f"Current subtask suggested action: {active_action or 'none'}\n"
+                f"Current plan:\n{plan_summary(current_plan)}\n\n"
                 f"Available tools: {json.dumps(available_tools, ensure_ascii=False)}\n"
                 f"Active constraints:\n{constraint_text}\n\n"
                 f"Task priors:\n{prior_summary}\n\n"
@@ -810,13 +548,79 @@ def main() -> None:
                 f"Retrieved context:\n{context}\n"
             )
 
-            plan = run_solver_worker(
+            recommender_plan = run_recommender(
                 base_url=base_url,
                 api_key=api_key,
                 model=chat_model,
-                planner_prompt=planner_prompt,
+                system_prompt=planner_prompt,
                 user_prompt=user_prompt,
             )
+            corrector_review = run_corrector(
+                base_url=base_url,
+                api_key=api_key,
+                model=chat_model,
+                target=target,
+                step=step,
+                active_title=active_title,
+                active_goal=active_goal,
+                active_signal=active_signal,
+                active_action=active_action,
+                controller_reflection=controller_reflection,
+                recommender=recommender_plan,
+                available_actions_text=actions_text,
+                memory_summary=memory_summary,
+                recent_history=short_history(history),
+            )
+            plan, judge = choose_final_proposal(
+                recommender=recommender_plan,
+                corrector=corrector_review,
+                active_action=active_action,
+            )
+            capability = resolve_capability_gap(
+                proposal=plan,
+                active_action=active_action,
+                available_tools=tools,
+                memory=memory,
+                artifact_dir=artifact_dir,
+            )
+            logistics = build_logistics_request(capability)
+            if capability.get("selected") != "keep_current":
+                capability_steps += 1
+                capability_entry = {
+                    "capability_step": capability_steps,
+                    "challenge_step": step,
+                    "selected": capability.get("selected", ""),
+                    "reason": capability.get("reason", ""),
+                    "gap": capability.get("gap", {}),
+                    "scores": capability.get("scores", []),
+                    "performed": bool(capability.get("performed", False)),
+                    "logistics_request": logistics,
+                }
+                if capability.get("artifact"):
+                    capability_entry["artifact"] = capability["artifact"]
+                capability_history.append(capability_entry)
+                memory.add_event(step, "capability_resolution", json.dumps(capability_entry, ensure_ascii=False)[:3000])
+                plan = capability.get("proposal", plan) if isinstance(capability.get("proposal"), dict) else plan
+                logistics_result = perform_logistics_request(
+                    request=logistics,
+                    run_shell_command=run_shell_command,
+                    env=env,
+                    artifact_dir=artifact_dir,
+                    timeout=min(120, args.cmd_timeout),
+                )
+                capability_entry["logistics_result"] = logistics_result
+                memory.add_event(step, "logistics_result", json.dumps(capability_entry, ensure_ascii=False)[:3000])
+                if int(logistics_result.get("returncode", 0)) == 0 and str(logistics.get("command", "")).strip():
+                    memory.add_tool_event(
+                        step=step,
+                        phase="logistics",
+                        tool_name="environment_setup",
+                        payload={"command": str(logistics.get("command", "")).strip(), "timeout_sec": min(120, args.cmd_timeout)},
+                    )
+                    available_tools = discover_tools()
+                    tools = available_tools
+            memory.upsert_fact("run.challenge_steps", str(len(history)), 0.99, step)
+            memory.upsert_fact("run.capability_steps", str(capability_steps), 0.99, step)
             analysis = str(plan.get("analysis", "")).strip()
             confidence = float(plan.get("confidence", 0.0) or 0.0)
             decision = str(plan.get("decision", "command")).strip().lower()
@@ -1007,6 +811,7 @@ def main() -> None:
 
             entry = {
             "step": step,
+            "challenge_step": step,
             "phase": phase,
             "expected_phase": expected_phase,
             "analysis": analysis,
@@ -1022,10 +827,30 @@ def main() -> None:
             "reflection": reflection,
             "hypothesis_updates": hypothesis_updates,
             "controller_reflection": controller_reflection,
+            "recommender": recommender_plan,
+            "corrector": corrector_review,
+            "judge": judge,
+            "capability": capability,
+            "logistics": logistics,
             "stdout_head": stdout_clean[:2000],
             "stderr_head": stderr_clean[:1200],
-        }
+            }
             history.append(entry)
+            active_id = str(active_subtask.get("id", "")).strip()
+            if active_id:
+                plan_patch = build_plan_patch(
+                    current=active_subtask,
+                    reflection=reflection,
+                    controller_reflection=controller_reflection,
+                    facts=facts,
+                    result=result,
+                    gain=gain,
+                )
+                current_plan = apply_plan_patch(current_plan, active_id, plan_patch)
+                persist_plan(memory, current_plan, step)
+                entry["plan_patch"] = plan_patch
+                entry["plan_after"] = current_plan
+                memory.add_event(step, "plan_patch", json.dumps(plan_patch, ensure_ascii=False)[:3000])
             print(f"[step {step}] {phase} rc={result['returncode']} cmd={cmd[:120]}")
 
             if done:
@@ -1068,6 +893,9 @@ def main() -> None:
         "memory_facts": memory.export_facts(),
         "execution_state": memory.export_execution_state(),
         "steps": history,
+        "challenge_steps": len(history),
+        "capability_steps": capability_steps,
+        "capability_history": capability_history,
         "done": done,
         "flag": found_flag,
         "final_report": final_report,
@@ -1085,7 +913,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         raise
-    # Keep cluster aligned with canonical reason->cluster mapping whenever reason is known.
-    mapped_cluster = cluster_for_failure_reason(normalized_failure_reason)
-    if mapped_cluster != "none" and out["failure_cluster"] == "none":
-        out["failure_cluster"] = mapped_cluster
