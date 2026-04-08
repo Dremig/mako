@@ -1,12 +1,22 @@
-# Blackbox CTF Knowledge Base
+# Blackbox CTF Agent + Knowledge Base
 
-This folder is a local-first knowledge base for blackbox-oriented CTF and web penetration workflows.
+This repo is a local-first blackbox CTF workspace with two core layers:
+- retrieval (`rag/`)
+- execution agent (`web_agent/`)
 
 ## Layout
 
 - `repos/`: upstream knowledge sources cloned from public repositories
 - `notes/`: retrieval strategy and source tagging notes
-- `scripts/`: sync scripts
+- `scripts/`: sync/build/run entry scripts
+- `rag/`: retrieval and index utilities
+- `web_agent/`: interpreter + solver + shared runtime state
+- `docs/`: architecture and iteration notes (`init`, `pentagi`)
+
+## Design Docs
+
+- `docs/init.md`: current baseline thinking after removing legacy `sync/`
+- `docs/pentagi.md`: PentAGI-driven integration notes and follow-up decisions
 
 ## Current Sources
 
@@ -89,17 +99,19 @@ Architecture:
 
 1. `task_interpreter` reads `objective + hint + observed signals + RAG context`
 2. interpreter writes `task_prior.*` into shared sqlite memory
-3. solver reads:
+3. solver/planner reads:
    - task priors
    - persistent facts
    - hypotheses
    - reflection constraints
-4. solver outputs one concrete shell command each step
-5. command output updates:
+4. controller reflection runs in parallel and emits policy constraints
+5. validator layer blocks phase drift, low-gain repeats, and semantic-recovery violations
+6. solver outputs one concrete shell command each step
+7. command output updates:
    - facts
    - reflection state
    - hypothesis lifecycle
-6. interpreter is refreshed periodically or after drift / repeated low-gain failure
+8. interpreter is refreshed periodically or after drift / repeated low-gain failure
 
 Architecture diagram:
 
@@ -131,8 +143,12 @@ Shared-memory data model:
 task_prior.*   -> interpreter-produced priors
 facts          -> runtime observations and extracted signals
 reflect.*      -> failure reason, strategy update, next-step constraints
+controller.*   -> policy reflection outputs (must_do / must_avoid / clusters)
 hypothesis.*   -> candidate / confirmed / weak_candidate / rejected
 events         -> compact execution trace
+flows          -> run-level status
+tasks_state    -> objective-level execution status
+subtasks_state -> step-level execution status and outcome
 ```
 
 Optional in `.env`:
@@ -143,9 +159,10 @@ OPENAI_AGENT_MODEL=gpt-5.2
 
 Main modules:
 
-1. `rag/task_interpreter.py`
-2. `rag/solver_shared.py`
-3. `rag/cmd_agent.py`
+1. `rag/index.py`, `rag/query.py`, `rag/agent.py`, `rag/common.py`
+2. `web_agent/task_interpreter.py`
+3. `web_agent/solver_shared.py`
+4. `web_agent/cmd_agent.py`
 
 Execution workflow is phase-based:
 
@@ -171,10 +188,11 @@ Control policy:
 
 1. phase state machine: `recon -> probe -> exploit -> extract -> verify`
 2. interpreter priors strongly constrain solver drift
-3. action validator blocks low-value repeats
-4. each step records an `info_gain` score from newly discovered facts
-5. each step generates a `reflection`
-6. hypotheses are explicitly tracked as:
+3. action validator uses modular rule registries (semantic rules + controller rules)
+4. failure reasons are normalized and mapped to canonical failure clusters
+5. each step records an `info_gain` score from newly discovered facts
+6. each step generates a `reflection`
+7. hypotheses are explicitly tracked as:
    - `candidate`
    - `confirmed`
    - `weak_candidate`
