@@ -17,7 +17,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_env
+from rag.common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_env
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:%?=&+-]+|[\u4e00-\u9fff]")

@@ -10,7 +10,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QUESTION="$1"
 shift || true
 
-python3 "$ROOT_DIR/rag/query.py" \
+PYTHONPATH="$ROOT_DIR" python3 -m rag.query \
   "$QUESTION" \
   --root "$ROOT_DIR" \
   --env ".env" \

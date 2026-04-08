@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from common import embed_texts, load_dotenv, require_env
+from rag.common import embed_texts, load_dotenv, require_env
 
 
 def parse_args() -> argparse.Namespace:

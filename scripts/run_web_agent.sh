@@ -13,7 +13,7 @@ OBJECTIVE="${2:-Find SQL injection and retrieve flag}"
 HINT="${3:-blackbox web SQL injection challenge}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-artifacts/cmd_agent}"
 
-PYTHONUNBUFFERED=1 python3 -u "$ROOT_DIR/rag/cmd_agent.py" \
+PYTHONPATH="$ROOT_DIR" PYTHONUNBUFFERED=1 python3 -u -m web_agent.cmd_agent \
   --root "$ROOT_DIR" \
   --env ".env" \
   --index "rag_data/index.jsonl" \

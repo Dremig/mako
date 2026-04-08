@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from agent import execute_request, fuzz_execute, load_dotenv
+from rag.agent import execute_request, fuzz_execute, load_dotenv
 
 
 def main() -> None:

@@ -6,11 +6,12 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 FLAG_RE = re.compile(r"(flag|ctf)\{[^{}\n]{1,200}\}", re.IGNORECASE)
@@ -81,20 +82,83 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 
+FAILURE_CLUSTERS = {
+    "none",
+    "drift",
+    "low_gain_loop",
+    "tool_mismatch",
+    "timeout_spiral",
+    "hypothesis_stale",
+    "execution_error",
+}
+
+FAILURE_REASONS = {
+    "none",
+    "needs_followup",
+    "missing_required_parameter",
+    "method_not_allowed",
+    "auth_required",
+    "invalid_parameter_format",
+    "timeout_on_valid_path",
+    "timeout_without_signal",
+    "tool_unavailable",
+    "command_failed",
+    "redundant_recon",
+    "repeated_low_gain_pattern",
+    "no_new_signal",
+}
+
+FAILURE_REASON_TO_CLUSTER = {
+    "none": "none",
+    "needs_followup": "none",
+    "missing_required_parameter": "hypothesis_stale",
+    "method_not_allowed": "execution_error",
+    "auth_required": "tool_mismatch",
+    "invalid_parameter_format": "execution_error",
+    "timeout_on_valid_path": "timeout_spiral",
+    "timeout_without_signal": "timeout_spiral",
+    "tool_unavailable": "tool_mismatch",
+    "command_failed": "execution_error",
+    "redundant_recon": "low_gain_loop",
+    "repeated_low_gain_pattern": "low_gain_loop",
+    "no_new_signal": "low_gain_loop",
+}
+
+
+def normalize_failure_reason(reason: str) -> str:
+    val = reason.strip().lower()
+    if not val:
+        return "none"
+    return val if val in FAILURE_REASONS else "needs_followup"
+
+
+def cluster_for_failure_reason(reason: str) -> str:
+    normalized = normalize_failure_reason(reason)
+    return FAILURE_REASON_TO_CLUSTER.get(normalized, "none")
+
+
+ControllerRule = Callable[..., str | None]
+
+
+def utc_now_z() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 
 class MemoryStore:
     def __init__(self, db_path: Path, run_id: str) -> None:
         self.db_path = db_path
         self.run_id = run_id
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_schema()
 
     def _init_schema(self) -> None:
-        self.conn.executescript(
-            """
+        with self._lock:
+            self.conn.executescript(
+                """
             CREATE TABLE IF NOT EXISTS facts (
               run_id TEXT NOT NULL,
               key TEXT NOT NULL,
@@ -112,17 +176,55 @@ class MemoryStore:
               content TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS flows (
+              run_id TEXT PRIMARY KEY,
+              target TEXT NOT NULL,
+              objective TEXT NOT NULL,
+              hint TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tasks_state (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              status TEXT NOT NULL,
+              step_start INTEGER NOT NULL,
+              step_end INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_state_run_id ON tasks_state(run_id);
+            CREATE TABLE IF NOT EXISTS subtasks_state (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL,
+              task_id INTEGER NOT NULL,
+              step INTEGER NOT NULL,
+              phase TEXT NOT NULL,
+              title TEXT NOT NULL,
+              status TEXT NOT NULL,
+              command TEXT NOT NULL DEFAULT '',
+              return_code INTEGER NOT NULL DEFAULT 0,
+              info_gain REAL NOT NULL DEFAULT 0,
+              error TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_subtasks_state_run_id ON subtasks_state(run_id);
+            CREATE INDEX IF NOT EXISTS idx_subtasks_state_task_id ON subtasks_state(task_id);
             """
-        )
-        self.conn.commit()
+            )
+            self.conn.commit()
 
     def upsert_fact(self, key: str, value: str, confidence: float, step: int) -> None:
-        now = datetime.utcnow().isoformat() + "Z"
-        old = self.conn.execute("SELECT confidence FROM facts WHERE run_id=? AND key=?", (self.run_id, key)).fetchone()
-        if old is not None and float(old[0]) > confidence:
-            return
-        self.conn.execute(
-            """
+        now = utc_now_z()
+        with self._lock:
+            old = self.conn.execute("SELECT confidence FROM facts WHERE run_id=? AND key=?", (self.run_id, key)).fetchone()
+            if old is not None and float(old[0]) > confidence:
+                return
+            self.conn.execute(
+                """
             INSERT INTO facts(run_id,key,value,confidence,source_step,updated_at)
             VALUES(?,?,?,?,?,?)
             ON CONFLICT(run_id,key) DO UPDATE SET
@@ -131,37 +233,193 @@ class MemoryStore:
               source_step=excluded.source_step,
               updated_at=excluded.updated_at
             """,
-            (self.run_id, key, value, confidence, step, now),
-        )
-        self.conn.commit()
+                (self.run_id, key, value, confidence, step, now),
+            )
+            self.conn.commit()
 
     def add_event(self, step: int, kind: str, content: str) -> None:
-        now = datetime.utcnow().isoformat() + "Z"
-        self.conn.execute(
-            "INSERT INTO events(run_id,step,kind,content,created_at) VALUES(?,?,?,?,?)",
-            (self.run_id, step, kind, content[:4000], now),
-        )
-        self.conn.commit()
+        now = utc_now_z()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO events(run_id,step,kind,content,created_at) VALUES(?,?,?,?,?)",
+                (self.run_id, step, kind, content[:4000], now),
+            )
+            self.conn.commit()
+
+    def add_tool_event(self, step: int, phase: str, tool_name: str, payload: dict[str, Any]) -> None:
+        event = {
+            "phase": phase,
+            "tool": tool_name,
+            "payload": payload,
+        }
+        self.add_event(step, f"tool_{tool_name}", json.dumps(event, ensure_ascii=False)[:3800])
+
+    def ensure_flow(self, target: str, objective: str, hint: str, status: str = "running") -> None:
+        now = utc_now_z()
+        with self._lock:
+            self.conn.execute(
+                """
+            INSERT INTO flows(run_id,target,objective,hint,status,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(run_id) DO UPDATE SET
+              target=excluded.target,
+              objective=excluded.objective,
+              hint=excluded.hint,
+              status=excluded.status,
+              updated_at=excluded.updated_at
+            """,
+                (self.run_id, target, objective, hint, status, now, now),
+            )
+            self.conn.commit()
+
+    def set_flow_status(self, status: str) -> None:
+        now = utc_now_z()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE flows SET status=?, updated_at=? WHERE run_id=?",
+                (status, now, self.run_id),
+            )
+            self.conn.commit()
+
+    def create_task_state(self, title: str, step_start: int, status: str = "running") -> int:
+        now = utc_now_z()
+        with self._lock:
+            cur = self.conn.execute(
+                """
+            INSERT INTO tasks_state(run_id,title,status,step_start,step_end,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+                (self.run_id, title[:300], status, step_start, 0, now, now),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    def set_task_state_status(self, task_id: int, status: str, step_end: int = 0) -> None:
+        now = utc_now_z()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE tasks_state SET status=?, step_end=?, updated_at=? WHERE id=? AND run_id=?",
+                (status, step_end, now, task_id, self.run_id),
+            )
+            self.conn.commit()
+
+    def create_subtask_state(self, task_id: int, step: int, phase: str, title: str, status: str = "running") -> int:
+        now = utc_now_z()
+        with self._lock:
+            cur = self.conn.execute(
+                """
+            INSERT INTO subtasks_state(run_id,task_id,step,phase,title,status,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+                (self.run_id, task_id, step, phase[:40], title[:300], status, now, now),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    def finish_subtask_state(
+        self,
+        subtask_id: int,
+        *,
+        status: str,
+        command: str = "",
+        return_code: int = 0,
+        info_gain: float = 0.0,
+        error: str = "",
+    ) -> None:
+        now = utc_now_z()
+        with self._lock:
+            self.conn.execute(
+                """
+            UPDATE subtasks_state
+            SET status=?, command=?, return_code=?, info_gain=?, error=?, updated_at=?
+            WHERE id=? AND run_id=?
+            """,
+                (status, command[:500], int(return_code), float(info_gain), error[:500], now, subtask_id, self.run_id),
+            )
+            self.conn.commit()
+
+    def export_execution_state(self) -> dict[str, Any]:
+        with self._lock:
+            flow = self.conn.execute(
+                "SELECT run_id,target,objective,hint,status,created_at,updated_at FROM flows WHERE run_id=?",
+                (self.run_id,),
+            ).fetchone()
+            tasks = self.conn.execute(
+                """
+            SELECT id,title,status,step_start,step_end,created_at,updated_at
+            FROM tasks_state WHERE run_id=? ORDER BY id
+            """,
+                (self.run_id,),
+            ).fetchall()
+            subtasks = self.conn.execute(
+                """
+            SELECT id,task_id,step,phase,title,status,command,return_code,info_gain,error,created_at,updated_at
+            FROM subtasks_state WHERE run_id=? ORDER BY id
+            """,
+                (self.run_id,),
+            ).fetchall()
+        return {
+            "flow": None if flow is None else {
+                "run_id": flow[0],
+                "target": flow[1],
+                "objective": flow[2],
+                "hint": flow[3],
+                "status": flow[4],
+                "created_at": flow[5],
+                "updated_at": flow[6],
+            },
+            "tasks": [
+                {
+                    "id": row[0],
+                    "title": row[1],
+                    "status": row[2],
+                    "step_start": row[3],
+                    "step_end": row[4],
+                    "created_at": row[5],
+                    "updated_at": row[6],
+                }
+                for row in tasks
+            ],
+            "subtasks": [
+                {
+                    "id": row[0],
+                    "task_id": row[1],
+                    "step": row[2],
+                    "phase": row[3],
+                    "title": row[4],
+                    "status": row[5],
+                    "command": row[6],
+                    "return_code": row[7],
+                    "info_gain": row[8],
+                    "error": row[9],
+                    "created_at": row[10],
+                    "updated_at": row[11],
+                }
+                for row in subtasks
+            ],
+        }
 
     def summary(self, max_items: int = 30) -> str:
-        rows = self.conn.execute(
-            """
+        with self._lock:
+            rows = self.conn.execute(
+                """
             SELECT key, value, confidence, source_step
             FROM facts WHERE run_id=?
             ORDER BY confidence DESC, source_step DESC
             LIMIT ?
             """,
-            (self.run_id, max_items),
-        ).fetchall()
+                (self.run_id, max_items),
+            ).fetchall()
         if not rows:
             return "none"
         return "\n".join([f"{k}={v} (conf={c:.2f}, step={s})" for k, v, c, s in rows])
 
     def export_facts(self) -> dict[str, Any]:
-        rows = self.conn.execute(
-            "SELECT key, value, confidence, source_step, updated_at FROM facts WHERE run_id=?",
-            (self.run_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT key, value, confidence, source_step, updated_at FROM facts WHERE run_id=?",
+                (self.run_id,),
+            ).fetchall()
         out: dict[str, Any] = {}
         for key, value, conf, step, updated_at in rows:
             out[key] = {
@@ -173,27 +431,30 @@ class MemoryStore:
         return out
 
     def get_fact(self, key: str) -> str | None:
-        row = self.conn.execute("SELECT value FROM facts WHERE run_id=? AND key=?", (self.run_id, key)).fetchone()
+        with self._lock:
+            row = self.conn.execute("SELECT value FROM facts WHERE run_id=? AND key=?", (self.run_id, key)).fetchone()
         return None if row is None else str(row[0])
 
     def has_prefix(self, prefix: str) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM facts WHERE run_id=? AND key LIKE ? LIMIT 1",
-            (self.run_id, f"{prefix}%"),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM facts WHERE run_id=? AND key LIKE ? LIMIT 1",
+                (self.run_id, f"{prefix}%"),
+            ).fetchone()
         return row is not None
 
     def prefix_rows(self, prefix: str, max_items: int = 20) -> list[tuple[str, str, float, int]]:
-        rows = self.conn.execute(
-            """
+        with self._lock:
+            rows = self.conn.execute(
+                """
             SELECT key, value, confidence, source_step
             FROM facts
             WHERE run_id=? AND key LIKE ?
             ORDER BY source_step DESC, confidence DESC
             LIMIT ?
             """,
-            (self.run_id, f"{prefix}%", max_items),
-        ).fetchall()
+                (self.run_id, f"{prefix}%", max_items),
+            ).fetchall()
         return [(str(k), str(v), float(c), int(s)) for k, v, c, s in rows]
 
 
@@ -460,6 +721,27 @@ def extract_query_params_from_command(command: str) -> list[str]:
     return params
 
 
+def extract_request_paths_from_command(command: str) -> list[str]:
+    paths: list[str] = []
+    for url_match in re.finditer(r"https?://[^\s\"']+", command):
+        raw = url_match.group(0).rstrip(");,")
+        try:
+            parsed = urllib.parse.urlparse(raw)
+        except ValueError:
+            continue
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        paths.append(path[:180])
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
 def extract_html_comments(html: str) -> list[str]:
     comments: list[str] = []
     for match in re.finditer(r"<!--(.*?)-->", html, re.DOTALL):
@@ -495,6 +777,7 @@ def extract_relative_paths(text: str) -> list[str]:
 def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str, float]]:
     facts: list[tuple[str, str, float]] = []
     merged = f"{stdout}\n{stderr}"
+    merged_lower = merged.lower()
 
     for name in extract_form_input_names(stdout):
         facts.append((f"entrypoint.candidate.{name}", "form-input", 0.80))
@@ -511,6 +794,12 @@ def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str
                 facts.append((f"form.sample.{name}", value[:180], 0.84))
     for name in extract_query_params_from_command(command):
         facts.append((f"entrypoint.candidate.{name}", "query-param", 0.82))
+    request_paths = extract_request_paths_from_command(command)
+    for path in request_paths:
+        path_hash = hashlib.md5(path.encode("utf-8")).hexdigest()[:8]
+        facts.append((f"endpoint.requested.{path_hash}", path, 0.86))
+    if request_paths:
+        facts.append(("endpoint.last", request_paths[0], 0.82))
     for comment in extract_html_comments(stdout):
         comment_hash = hashlib.md5(comment.encode("utf-8")).hexdigest()[:8]
         facts.append((f"hint.comment.{comment_hash}", comment, 0.84))
@@ -556,6 +845,44 @@ def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str
         war_path = war_match.group(1).strip()
         if war_path:
             facts.append(("artifact.war_path", war_path[:220], 0.86))
+
+    status_match = re.search(r"HTTP/\d(?:\.\d)?\s+(\d{3})", merged, re.IGNORECASE)
+    if status_match:
+        status_code = status_match.group(1)
+        facts.append(("http.last_status", status_code, 0.90))
+        if status_code == "405":
+            facts.append(("error.semantic.method_not_allowed", "true", 0.95))
+        if status_code == "401":
+            facts.append(("error.semantic.auth_required", "true", 0.94))
+    allow_match = re.search(r"^allow:\s*([^\n\r]+)$", merged, re.IGNORECASE | re.MULTILINE)
+    if allow_match:
+        methods = ",".join(sorted({m.strip().upper() for m in allow_match.group(1).split(",") if m.strip()}))
+        if methods:
+            facts.append(("http.allow_methods", methods[:120], 0.92))
+    if "method not allowed" in merged_lower:
+        facts.append(("error.semantic.method_not_allowed", "true", 0.95))
+    if "www-authenticate:" in merged_lower:
+        facts.append(("error.semantic.auth_required", "true", 0.90))
+    if re.search(r"\b(malformed|invalid)\s+json\b|\bjsondecodeerror\b|\binvalid\s+(?:parameter|field|value|format)\b", merged, re.IGNORECASE):
+        facts.append(("error.semantic.invalid_parameter_format", "true", 0.92))
+
+    required_names: list[str] = []
+    for m in re.finditer(
+        r"\bmissing\s+(?:required\s+)?(?:parameter|param|field)?\s*[:\-]?\s*([a-zA-Z][a-zA-Z0-9_\- ]{0,32})",
+        merged,
+        re.IGNORECASE,
+    ):
+        raw = m.group(1).strip(" .,:;()[]{}\"'").lower()
+        if raw and raw not in {"value", "input", "request", "body", "data"}:
+            required_names.append(raw)
+    for m in re.finditer(r"\b([a-zA-Z][a-zA-Z0-9_\-]{1,32})\s+is\s+required\b", merged, re.IGNORECASE):
+        required_names.append(m.group(1).strip().lower())
+    if required_names:
+        facts.append(("error.semantic.missing_required_parameter", "true", 0.96))
+        norm = required_names[0].replace(" ", "_").replace("-", "_")
+        facts.append(("error.required_parameter", norm[:64], 0.96))
+        if request_paths:
+            facts.append(("endpoint.focus", request_paths[0], 0.90))
 
     dbms_match = re.search(r"back-end DBMS:\s*([^\n\r]+)", merged, re.IGNORECASE)
     if dbms_match:
@@ -650,6 +977,11 @@ def derive_phase_state(memory: MemoryStore, history: list[dict[str, Any]]) -> tu
     has_hidden_form_defaults = memory.has_prefix("form.hidden.")
     has_json_form_field = memory.has_prefix("form.json_field.")
     has_debug_leak = memory.get_fact("debug.traceback_exposed") == "true"
+    has_missing_required = memory.get_fact("error.semantic.missing_required_parameter") == "true"
+    has_method_not_allowed = memory.get_fact("error.semantic.method_not_allowed") == "true"
+    has_auth_required = memory.get_fact("error.semantic.auth_required") == "true"
+    has_invalid_param_format = memory.get_fact("error.semantic.invalid_parameter_format") == "true"
+    focus_endpoint = memory.get_fact("endpoint.focus") or memory.get_fact("endpoint.last")
 
     if has_flag:
         phase = "verify"
@@ -662,6 +994,22 @@ def derive_phase_state(memory: MemoryStore, history: list[dict[str, Any]]) -> tu
     elif has_debug_leak:
         phase = "extract"
         constraints.append("A debug traceback is exposed; inspect the traceback and comments for secrets or flags before any further probing.")
+    elif has_missing_required:
+        phase = "probe"
+        constraints.append("A required request parameter is missing; stop broad discovery and recover required parameter names/format first.")
+        if focus_endpoint:
+            constraints.append(f"Focus on endpoint {focus_endpoint}; iterate parameter names/methods until server-side error class changes.")
+    elif has_method_not_allowed:
+        phase = "probe"
+        constraints.append("Method mismatch is detected; recover allowed HTTP methods and valid request shape before route discovery.")
+        if memory.get_fact("http.allow_methods"):
+            constraints.append(f"Prefer allowed methods: {memory.get_fact('http.allow_methods')}.")
+    elif has_auth_required:
+        phase = "probe"
+        constraints.append("Authentication is required; focus on auth/token acquisition and session setup, not generic endpoint brute force.")
+    elif has_invalid_param_format:
+        phase = "probe"
+        constraints.append("Parameter format is invalid; recover server-accepted encoding/schema before adding new attack surfaces.")
     elif has_dbms or has_injection:
         phase = "extract"
         constraints.append("Do not return to broad recon; focus on extraction and verification.")
@@ -721,14 +1069,106 @@ def info_gain_score(memory: MemoryStore, new_facts: list[tuple[str, str, float]]
     return score
 
 
+def _rule_controller_change_command_family(
+    *,
+    require_change_family: bool,
+    previous_family: str,
+    current_family: str,
+    previous_rc: int,
+    previous_gain: float,
+    **_: Any,
+) -> str | None:
+    if (
+        require_change_family
+        and previous_family
+        and current_family == previous_family
+        and (previous_rc != 0 or previous_gain <= 0)
+    ):
+        return (
+            "Controller requires command family change after low-value step: "
+            f"previous={previous_family}, current={current_family}"
+        )
+    return None
+
+
+def _rule_controller_cluster_family_repeat(
+    *,
+    failure_cluster: str,
+    previous_family: str,
+    current_family: str,
+    **_: Any,
+) -> str | None:
+    if failure_cluster in {"timeout_spiral", "low_gain_loop"} and previous_family and current_family == previous_family:
+        return f"Controller blocked repeated command family under {failure_cluster}: {current_family}"
+    return None
+
+
+def _rule_controller_recon_regression(
+    *,
+    phase: str,
+    must_avoid: list[str],
+    **_: Any,
+) -> str | None:
+    for item in must_avoid:
+        if "do not regress to recon" in item.lower() and phase == "recon":
+            return "Controller blocked recon regression."
+    return None
+
+
+def _rule_semantic_recovery_discovery_drift(
+    *,
+    cmd: str,
+    has_missing_required: bool,
+    has_method_not_allowed: bool,
+    has_auth_required: bool,
+    **_: Any,
+) -> str | None:
+    patterns = ("robots.txt", "sitemap.xml", ".well-known", "security.txt", "http-enum")
+    is_drift = any(p in cmd for p in patterns)
+    if (has_missing_required or has_method_not_allowed or has_auth_required) and is_drift:
+        return "Semantic error recovery is active; avoid broad discovery paths and focus on request-shape/auth recovery."
+    return None
+
+
+def _rule_semantic_missing_required_focus(
+    *,
+    cmd: str,
+    has_missing_required: bool,
+    focus_endpoint: str,
+    **_: Any,
+) -> str | None:
+    if has_missing_required and focus_endpoint and focus_endpoint not in cmd:
+        return f"Missing-parameter recovery active; action must focus on {focus_endpoint}."
+    return None
+
+
+SEMANTIC_VALIDATION_RULES: tuple[ControllerRule, ...] = (
+    _rule_semantic_recovery_discovery_drift,
+    _rule_semantic_missing_required_focus,
+)
+
+
+CONTROLLER_VALIDATION_RULES: tuple[ControllerRule, ...] = (
+    _rule_controller_change_command_family,
+    _rule_controller_cluster_family_repeat,
+    _rule_controller_recon_regression,
+)
+
+
 def validate_action(
     phase: str,
     expected_phase: str,
     command: str,
     memory: MemoryStore,
     history: list[dict[str, Any]],
+    controller_reflection: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     cmd = command.lower()
+    focus_endpoint = (memory.get_fact("endpoint.focus") or memory.get_fact("endpoint.last") or "").strip().lower()
+    has_missing_required = memory.get_fact("error.semantic.missing_required_parameter") == "true"
+    has_method_not_allowed = memory.get_fact("error.semantic.method_not_allowed") == "true"
+    has_auth_required = memory.get_fact("error.semantic.auth_required") == "true"
+
     has_candidate_entrypoints = memory.has_prefix("entrypoint.candidate.") or memory.has_prefix("endpoint.candidate.")
     if expected_phase == "probe" and phase == "recon" and has_candidate_entrypoints:
         return False, "Known entrypoint candidates exist; recon should not continue."
@@ -741,6 +1181,44 @@ def validate_action(
             return False, "Exploit/extract requires a confirmed entrypoint or vulnerability signal."
     if history and "skipped-duplicate-command" in str(history[-1].get("signal", "")):
         return False, "Previous action was duplicate-like; choose a materially different command."
+    semantic_rule_ctx = {
+        "cmd": cmd,
+        "has_missing_required": has_missing_required,
+        "has_method_not_allowed": has_method_not_allowed,
+        "has_auth_required": has_auth_required,
+        "focus_endpoint": focus_endpoint,
+    }
+    for rule in SEMANTIC_VALIDATION_RULES:
+        reason = rule(**semantic_rule_ctx)
+        if reason:
+            return False, reason
+
+    # Hard constraints from controller reflection (policy layer).
+    policy = controller_reflection or {}
+    failure_cluster = str(policy.get("failure_cluster", "")).strip().lower()
+    if failure_cluster not in FAILURE_CLUSTERS:
+        failure_cluster = "none"
+    must_avoid = [str(item).strip() for item in policy.get("must_avoid", []) if str(item).strip()]
+    requirements = policy.get("requirements", {}) if isinstance(policy, dict) else {}
+    require_change_family = bool(requirements.get("change_command_family", False))
+    current_family = _command_family(command)
+    previous_family = _command_family(str(history[-1].get("command", ""))) if history else ""
+    previous_rc = int(history[-1].get("returncode", 0)) if history else 0
+    previous_gain = float(history[-1].get("info_gain", 0) or 0) if history else 0.0
+    rule_ctx = {
+        "phase": phase,
+        "failure_cluster": failure_cluster,
+        "must_avoid": must_avoid,
+        "require_change_family": require_change_family,
+        "current_family": current_family,
+        "previous_family": previous_family,
+        "previous_rc": previous_rc,
+        "previous_gain": previous_gain,
+    }
+    for rule in CONTROLLER_VALIDATION_RULES:
+        reason = rule(**rule_ctx)
+        if reason:
+            return False, reason
     return True, ""
 
 
@@ -804,6 +1282,12 @@ def reflect_step(
     family = _command_family(command)
     found_flag = bool(FLAG_RE.search(merged))
     has_progress_fact = any(k in {"dbms", "current_database", "injection.parameter"} or k.startswith("entrypoint.confirmed.") for k, _, _ in facts)
+    has_missing_required = any(k == "error.semantic.missing_required_parameter" and str(v).lower() == "true" for k, v, _ in facts)
+    has_method_not_allowed = any(k == "error.semantic.method_not_allowed" and str(v).lower() == "true" for k, v, _ in facts)
+    has_auth_required = any(k == "error.semantic.auth_required" and str(v).lower() == "true" for k, v, _ in facts)
+    has_invalid_param_format = any(k == "error.semantic.invalid_parameter_format" and str(v).lower() == "true" for k, v, _ in facts)
+    required_param = next((str(v) for k, v, _ in facts if k == "error.required_parameter" and str(v).strip()), "")
+    focus_endpoint = next((str(v) for k, v, _ in facts if k in {"endpoint.focus", "endpoint.last"} and str(v).strip()), "")
     repeated_timeouts = 0
     repeated_family = 0
     for item in reversed(history):
@@ -827,6 +1311,42 @@ def reflect_step(
         failure_reason = "none"
         strategy_update = "Flag found. Move to verification and final reporting."
         next_constraints.append("Do not continue exploitation after a candidate flag is found; verify and stop.")
+    elif has_missing_required:
+        judgment = "failure"
+        failure_reason = "missing_required_parameter"
+        strategy_update = "Server indicates required request parameters are missing. Switch to request-shape recovery."
+        next_constraints.extend([
+            "Do not continue broad endpoint discovery while a required-parameter error is active.",
+            "Recover parameter names/schema from the same endpoint's HTML, JS, or error transitions.",
+        ])
+        if focus_endpoint:
+            next_constraints.append(f"Keep focus on endpoint: {focus_endpoint}.")
+        if required_param:
+            next_constraints.append(f"Include required parameter candidate in next request: {required_param}.")
+    elif has_method_not_allowed:
+        judgment = "failure"
+        failure_reason = "method_not_allowed"
+        strategy_update = "Request method is rejected. Recover allowed method(s) and retry with minimal body."
+        next_constraints.extend([
+            "Stop adding new paths; first recover and use allowed HTTP methods.",
+            "Compare error transitions between method/body variants on the same endpoint.",
+        ])
+    elif has_auth_required:
+        judgment = "failure"
+        failure_reason = "auth_required"
+        strategy_update = "Authentication gate detected. Shift to token/session acquisition before further endpoint probing."
+        next_constraints.extend([
+            "Prioritize auth/token/session recovery over unauthenticated path brute force.",
+            "Preserve cookies/session context between requests when testing auth transitions.",
+        ])
+    elif has_invalid_param_format:
+        judgment = "failure"
+        failure_reason = "invalid_parameter_format"
+        strategy_update = "Parameter syntax/encoding is invalid. Recover accepted format before exploring new routes."
+        next_constraints.extend([
+            "Keep endpoint constant and vary one parameter format dimension at a time.",
+            "Use error-class change as the success signal for format recovery.",
+        ])
     elif rc == 124 and (phase in {"exploit", "extract"} or has_progress_fact):
         judgment = "failure"
         failure_reason = "timeout_on_valid_path"
@@ -897,6 +1417,9 @@ def reflect_step(
     if success_signal:
         next_constraints.append(f"Prefer commands that can directly validate this signal: {success_signal[:180]}")
 
+    failure_reason = normalize_failure_reason(failure_reason)
+    failure_cluster = cluster_for_failure_reason(failure_reason)
+
     unique_constraints: list[str] = []
     seen: set[str] = set()
     for item in next_constraints:
@@ -908,6 +1431,7 @@ def reflect_step(
     payload = {
         "judgment": judgment,
         "failure_reason": failure_reason,
+        "failure_cluster": failure_cluster,
         "strategy_update": strategy_update,
         "next_action_constraints": unique_constraints[:4],
         "command_family": family,
@@ -915,6 +1439,7 @@ def reflect_step(
 
     memory.upsert_fact("reflect.last_judgment", judgment, 0.96, step)
     memory.upsert_fact("reflect.last_failure_reason", failure_reason, 0.96, step)
+    memory.upsert_fact("reflect.last_failure_cluster", failure_cluster, 0.96, step)
     memory.upsert_fact("reflect.last_strategy_update", strategy_update, 0.94, step)
     memory.upsert_fact("reflect.last_command_family", family, 0.90, step)
     for index, item in enumerate(unique_constraints[:4], start=1):
@@ -1068,12 +1593,25 @@ def recent_observations(history: list[dict[str, Any]], limit: int = 5) -> str:
 
 def extract_json(text: str) -> dict[str, Any]:
     def _loads_with_repair(candidate: str) -> dict[str, Any]:
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", candidate)
         try:
-            return json.loads(candidate)
+            return json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            repaired = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", candidate)
-            if repaired != candidate:
-                return json.loads(repaired)
+            # 1) Escape only invalid backslashes.
+            repaired = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", cleaned)
+            if repaired != cleaned:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
+            # 2) Aggressive fallback: double all backslashes to avoid invalid
+            # escape sequences in model-produced command strings.
+            aggressive = cleaned.replace("\\", "\\\\")
+            if aggressive != cleaned:
+                try:
+                    return json.loads(aggressive)
+                except json.JSONDecodeError:
+                    pass
             raise exc
 
     text = text.strip()

@@ -12,7 +12,7 @@ TARGET="$1"
 KIND="${2:-path}"
 WORDLIST="${3:-path-small}"
 
-python3 "$ROOT_DIR/rag/quick_fuzz.py" \
+PYTHONPATH="$ROOT_DIR" python3 -m rag.quick_fuzz \
   --root "$ROOT_DIR" \
   --env ".env" \
   --target "$TARGET" \

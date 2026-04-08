@@ -4,9 +4,18 @@ import json
 import re
 from typing import Any
 
-from agent import hybrid_retrieve, short_history
-from common import chat_completion
-from solver_shared import MemoryStore, extract_json, recent_observations, task_prior_map
+from rag.agent import hybrid_retrieve, short_history
+from rag.common import chat_completion
+from web_agent.solver_shared import MemoryStore, extract_json, recent_observations, task_prior_map
+
+
+STRICT_JSON_RULES = (
+    "CRITICAL OUTPUT RULES:\n"
+    "Return exactly one valid JSON object only.\n"
+    "Do not output markdown, code fences, comments, or any text before/after JSON.\n"
+    "Use double quotes for all keys/strings.\n"
+    "If uncertain, keep schema fields with safe defaults instead of adding prose.\n"
+)
 
 
 FAMILY_KEYWORDS = {
@@ -208,6 +217,7 @@ def run_task_interpreter(
         "You are a task interpreter for a blackbox CTF solving system.\n"
         "Infer the most likely challenge family, initial vulnerability routes, and drift controls.\n"
         "Use description/hint as strong priors, but allow runtime evidence to refine secondary routes.\n"
+        f"{STRICT_JSON_RULES}"
         "Return ONLY JSON schema:\n"
         "{"
         "\"challenge_family\":\"web|misc|pwn|rev|crypto|unknown\","
@@ -232,14 +242,28 @@ def run_task_interpreter(
         f"Heuristic prior:\n{json.dumps(heuristic, ensure_ascii=False)}\n"
     )
     try:
-        raw = chat_completion(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            messages=[{"role": "system", "content": planner_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.1,
-        )
-        prior = extract_json(raw)
+        prior = {}
+        local_user_prompt = user_prompt
+        for attempt in range(1, 4):
+            raw = chat_completion(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                messages=[{"role": "system", "content": planner_prompt}, {"role": "user", "content": local_user_prompt}],
+                temperature=0.1,
+            )
+            try:
+                prior = extract_json(raw)
+                break
+            except Exception:
+                if attempt >= 3:
+                    prior = heuristic
+                else:
+                    local_user_prompt = (
+                        user_prompt
+                        + "\n\nYour previous output was not valid JSON. "
+                        + STRICT_JSON_RULES
+                    )
     except Exception:
         prior = heuristic
 

@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_env
+from rag.common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_env
 
 
 def parse_args() -> argparse.Namespace:
